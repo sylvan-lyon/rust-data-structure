@@ -3,7 +3,7 @@ struct Solution;
 fn factor(x: i32) -> usize {
     let mut mul: usize = 0;
     for val in 1..x {
-        mul = mul * val as usize
+        mul *= val as usize
     }
     mul
 }
