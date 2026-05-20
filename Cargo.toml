@@ -1,0 +1,14 @@
+[package]
+name = "rust-learn"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = ["crates/aliases", "crates/queue", "crates/tree"]
+
+[workspace.dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
+mimalloc = "0.1.50"
+rand = "0.10.1"
+
+[dev-dependencies]
