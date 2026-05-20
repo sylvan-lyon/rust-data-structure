@@ -208,7 +208,7 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
 
         Self {
             buf: ptr,
-            cap: cap,
+            cap,
             top: 0,
             alloc,
             incre,
