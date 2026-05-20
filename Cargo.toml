@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/aliases", "crates/queue", "crates/tree"]
+members = ["crates/aliases", "crates/list", "crates/tree"]
 
 [workspace.dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
