@@ -1,0 +1,15 @@
+[package]
+name = "list"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[dev-dependencies]
+criterion.workspace = true
+mimalloc.workspace = true
+rand.workspace = true
+
+[[bench]]
+name = "grow"
+harness = false
