@@ -1,5 +1,7 @@
+use core::slice;
 use std::{
     alloc::{Allocator, Global, Layout, handle_alloc_error},
+    fmt::Debug,
     ops::{Index, IndexMut},
     ptr::{NonNull, drop_in_place},
 };
@@ -28,11 +30,17 @@ where
     incre: C,
 }
 
-pub struct StackIter<'a, T, A, C>(&'a mut Stack<T, A, C>)
+pub struct StackIter<T, A, C>(Stack<T, A, C>)
 where
     T: Sized,
     A: Allocator,
     C: CapacityIncrement;
+
+impl<T: Sized> Default for Stack<T, Global, DefaultIncrement> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl<T: Sized> Stack<T, Global, DefaultIncrement> {
     #[inline]
@@ -46,7 +54,7 @@ impl<T: Sized> Stack<T, Global, DefaultIncrement> {
     }
 }
 
-impl<'a, T, A, C> Iterator for StackIter<'a, T, A, C>
+impl<T, A, C> Iterator for StackIter<T, A, C>
 where
     T: Sized,
     A: Allocator,
@@ -54,31 +62,68 @@ where
 {
     type Item = T;
 
+    /// polls next value from stack
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    ///
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// stack.push(2);
+    /// let mut iter = stack.into_iter();
+    /// assert_eq!(iter.next(), Some(2));
+    /// assert_eq!(iter.next(), Some(1));
+    /// assert_eq!(iter.next(), None);
+    /// ```
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop()
     }
 }
 
-impl<'a, T, A, C> IntoIterator for &'a mut Stack<T, A, C>
+impl<T, A, C> IntoIterator for Stack<T, A, C>
 where
     T: Sized,
     A: Allocator,
     C: CapacityIncrement,
 {
     type Item = T;
-    type IntoIter = StackIter<'a, T, A, C>;
+    type IntoIter = StackIter<T, A, C>;
 
+    /// consumes and turn itself into a [`StackIter`]
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
         StackIter(self)
     }
 }
 
+impl<T, A, C> Debug for Stack<T, A, C>
+where
+    T: Sized + Debug,
+    A: Allocator,
+    C: CapacityIncrement,
+{
+    /// debug format, bottom on the left, top on the right
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1); // bottom
+    /// stack.push(2); // top
+    /// assert_eq!(format!("{:?}", stack), "[1, 2]")
+    /// ```
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries((unsafe { slice::from_raw_parts::<T>(self.buf, self.top) }).iter())
+            .finish()
+    }
+}
+
 impl<T: Sized, A: Allocator, C: CapacityIncrement> Drop for Stack<T, A, C> {
     fn drop(&mut self) {
-        // first we call destructor on each slot
-        for i in 0..self.top {
+        // first we call destructor on each slot, reversed, in other words,
+        // we destruct values in stack output order
+        for i in (0..self.top).rev() {
             unsafe { drop_in_place(self.buf.add(i)) }
         }
 
@@ -147,11 +192,7 @@ where
     /// let _move: String = stack[0];   // compilation error
     /// ```
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        if index >= self.top {
-            panic!("indexed beyond [0, top)")
-        } else {
-            unsafe { &mut *self.buf.add(index) }
-        }
+        self.get_mut(index).expect("index stack beyond [0, top)")
     }
 }
 
@@ -181,11 +222,7 @@ where
     /// let _move: String = stack[0];   // compilation error
     /// ```
     fn index(&self, index: usize) -> &Self::Output {
-        if index >= self.top {
-            panic!("indexed beyond [0, top)")
-        } else {
-            unsafe { &*self.buf.add(index) }
-        }
+        self.get(index).expect("index stack beyond [0, top)")
     }
 }
 
@@ -215,6 +252,91 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
         }
     }
 
+    /// get `index`th element's reference of this stack, returns [`None`] if stack is empty
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// assert_eq!(stack.get(0), Some(1).as_ref());
+    /// assert_eq!(stack.get(1), None);
+    /// ```
+    #[inline]
+    pub fn get(&self, index: usize) -> Option<&T> {
+        if index < self.top {
+            Some(unsafe { &*self.buf.add(index) })
+        } else {
+            None
+        }
+    }
+
+    /// get `index`th element's mutable reference of this stack, returns [`None`] if stack is empty
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// assert_eq!(stack.get_mut(0), Some(1).as_mut());
+    /// assert_eq!(stack.get(1), None);
+    /// ```
+    #[inline]
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index < self.top {
+            Some(unsafe { &mut *self.buf.add(index) })
+        } else {
+            None
+        }
+    }
+
+    /// get top element's reference of this stack, returns [`None`] if stack is empty
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// assert_eq!(stack.peek(), Some(1).as_ref());
+    /// assert_eq!(stack.pop(), Some(1));
+    /// assert_eq!(stack.peek(), None);
+    /// ```
+    #[inline]
+    pub fn peek(&self) -> Option<&T> {
+        if self.top > 0 {
+            Some(unsafe { &*self.buf.add(self.top - 1) })
+        } else {
+            None
+        }
+    }
+
+    /// get top element's mutable reference of this stack, returns [`None`] if stack is empty
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// assert_eq!(stack.peek_mut(), Some(1).as_mut());
+    /// assert_eq!(stack.pop(), Some(1));
+    /// assert_eq!(stack.peek_mut(), None);
+    /// ```
+    #[inline]
+    pub fn peek_mut(&mut self) -> Option<&mut T> {
+        if self.top > 0 {
+            Some(unsafe { &mut *self.buf.add(self.top - 1) })
+        } else {
+            None
+        }
+    }
+
+    /// pushes value into this stack
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// stack.push(2);
+    /// assert_eq!(stack.pop(), Some(2));
+    /// assert_eq!(stack.pop(), Some(1));
+    /// assert_eq!(stack.pop(), None);
+    /// ```
     #[inline]
     pub fn push(&mut self, value: T) {
         if self.top == self.cap {
@@ -228,6 +350,17 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
         unsafe { self.buf.add(pos).write(value) };
     }
 
+    /// pop value from this stack, returns [`None`] if this stack is empty
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push(1);
+    /// stack.push(2);
+    /// assert_eq!(stack.pop(), Some(2));
+    /// assert_eq!(stack.pop(), Some(1));
+    /// assert_eq!(stack.pop(), None);
+    /// ```
     #[inline]
     pub fn pop(&mut self) -> Option<T> {
         if self.top == 0 {
@@ -260,7 +393,7 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
     pub fn grow_to(&mut self, new_cap: usize) {
         assert!(self.cap < new_cap);
 
-        let old_buf = self.buf;
+        let (old_cap, old_buf) = (self.cap, self.buf);
         let layout = Layout::array::<T>(new_cap).expect("layout");
         let new_buf = self
             .alloc
@@ -273,6 +406,15 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
             for i in 0..self.top {
                 unsafe { new_buf.add(i).write(old_buf.add(i).read()) }
             }
+        }
+
+        match NonNull::new(old_buf as *mut u8) {
+            Some(ptr) => {
+                assert_ne!(old_cap, 0);
+                let old_layout = Layout::array::<T>(old_cap).expect("layout");
+                unsafe { self.alloc.deallocate(ptr, old_layout) }
+            }
+            None => assert_eq!(old_cap, 0),
         }
 
         self.cap = new_cap;
@@ -328,14 +470,20 @@ mod test {
     #[test]
     fn test_stack_drop() {
         thread_local! {
-            /// DROPED[i] == false means the flower with id `i` has not been dropped
-            static DROPED: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+            /// DROPPED[i] == false means the flower with id `i` has not been dropped
+            static DROPPED: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
 
-            /// DROPED_CLONE[i] == false means the flower with id `i` has not been dropped
-            static DROPED_CLONE: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+            /// DROPPED_SEQ[i] == id means the item with id `id` is the `i + 1`th item dropped
+            static DROPPED_SEQ: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(TIMES));
+
+            /// DROPPED_CLONE[i] == false means the flower with id `i` has not been dropped
+            static DROPPED_CLONE: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+
+            /// DROPPED_CLONE_SEQ[i] == id means the item with id `id` is the `i + 1`th item dropped
+            static DROPPED_CLONE_SEQ: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(TIMES));
 
             /// next item id
-            static NEXT_ID: Cell<usize> = Cell::new(0);
+            static NEXT_ID: Cell<usize> = const { Cell::new(0) };
         }
 
         struct Item {
@@ -355,8 +503,18 @@ mod test {
         }
         // ends before this back curly brace
 
-        assert!(DROPED_CLONE.with_borrow(|vec| vec.iter().all(|droped| *droped)));
-        assert!(DROPED.with_borrow(|vec| vec.iter().all(|droped| *droped)));
+        assert!(DROPPED_CLONE.with_borrow(|vec| vec.iter().all(|dropped| *dropped)));
+        assert!(DROPPED.with_borrow(|vec| vec.iter().all(|dropped| *dropped)));
+        assert!(DROPPED_CLONE_SEQ.with_borrow(|vec| {
+            vec.iter()
+                .enumerate()
+                .all(|(index, id)| index + id == TIMES - 1)
+        }));
+        assert!(DROPPED_SEQ.with_borrow(|vec| {
+            vec.iter()
+                .enumerate()
+                .all(|(index, id)| index + id == TIMES - 1)
+        }));
 
         // impl Item
         const _: () = {
@@ -371,9 +529,11 @@ mod test {
             impl Drop for Item {
                 fn drop(&mut self) {
                     if self.cloned {
-                        DROPED_CLONE.with_borrow_mut(|vec| vec[self.id] = true)
+                        DROPPED_CLONE_SEQ.with_borrow_mut(|vec| vec.push(self.id));
+                        DROPPED_CLONE.with_borrow_mut(|vec| vec[self.id] = true)
                     } else {
-                        DROPED.with_borrow_mut(|vec| vec[self.id] = true)
+                        DROPPED_SEQ.with_borrow_mut(|vec| vec.push(self.id));
+                        DROPPED.with_borrow_mut(|vec| vec[self.id] = true)
                     }
                 }
             }

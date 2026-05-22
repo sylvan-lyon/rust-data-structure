@@ -5,7 +5,6 @@ use std::{
 
 use crate::{CapacityIncrement, DefaultIncrement};
 
-#[derive(Debug)]
 pub struct Queue<T, A = Global, C = DefaultIncrement>
 where
     T: Sized,
@@ -30,6 +29,7 @@ where
     /// allocator
     alloc: A,
 
+    /// increment calculator
     incre: C,
 }
 
@@ -82,7 +82,7 @@ where
     #[inline]
     pub fn new_in(alloc: A, incre: C) -> Self {
         Self {
-            buf: std::ptr::null_mut::<T>(),
+            buf: std::ptr::null_mut(),
             head: 0,
             tail: 0,
             cap: 0,
@@ -162,13 +162,13 @@ where
             return;
         }
 
-        let old_buf = self.buf;
-        let layout = Layout::array::<T>(new_cap).expect("layout");
+        let (old_cap, old_buf) = (self.cap, self.buf);
+        let new_layout = Layout::array::<T>(new_cap).expect("layout");
         let new_buf = self
             .alloc
-            .allocate(layout)
+            .allocate(new_layout)
             .map(|ptr| ptr.as_ptr() as *mut T)
-            .map_err(|_| handle_alloc_error(layout))
+            .map_err(|_| handle_alloc_error(new_layout))
             .unwrap();
 
         if !self.buf.is_null() {
@@ -184,9 +184,15 @@ where
             }
         }
 
-        // in case self is grown from 0
-        if self.cap != 0 {
-            self.head += new_cap - self.cap;
+        match NonNull::new(old_buf as *mut u8) {
+            Some(ptr) => {
+                // in case self is grown from 0
+                assert_ne!(old_cap, 0);
+                self.head += new_cap - old_cap;
+                let old_layout = Layout::array::<T>(old_cap).expect("layout");
+                unsafe { self.alloc.deallocate(ptr, old_layout) }
+            }
+            None => assert_eq!(old_cap, 0),
         }
 
         self.cap = new_cap;

@@ -1,4 +1,4 @@
-use queue::Queue;
+use list::queue::Queue;
 
 use crate::{Traverse, TreeNode};
 

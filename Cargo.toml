@@ -1,14 +1,25 @@
 [package]
 name = "rust-learn"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+default-run = "rust-learn"
 
 [workspace]
 members = ["crates/aliases", "crates/list", "crates/tree"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
 
 [workspace.dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 mimalloc = "0.1.50"
 rand = "0.10.1"
+
+[dependencies]
+list = { path = "crates/list" }
+tree = { path = "crates/tree" }
 
 [dev-dependencies]
