@@ -3,13 +3,13 @@ use std::{
     ptr::NonNull,
 };
 
-use crate::{CapacityIncrement, DefaultIncrement};
+use crate::{increment, Increment};
 
-pub struct Queue<T, A = Global, C = DefaultIncrement>
+pub struct Queue<T, A = Global, C = Increment>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     /// buffer, which contains `self.cap` slots of `T`
     buf: *mut T,
@@ -44,7 +44,7 @@ impl<T, A, C> Drop for Queue<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     fn drop(&mut self) {
         for i in 0..self.len {
@@ -64,12 +64,12 @@ where
 impl<T> Queue<T, Global> {
     #[inline]
     pub fn new() -> Self {
-        Self::new_in(Global, DefaultIncrement)
+        Self::new_in(Global, increment)
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self::with_capacity_exact_in(cap, Global, DefaultIncrement)
+        Self::with_capacity_exact_in(cap, Global, increment)
     }
 }
 
@@ -77,7 +77,7 @@ impl<T, A, C> Queue<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     #[inline]
     pub fn new_in(alloc: A, incre: C) -> Self {
@@ -145,7 +145,7 @@ where
 
     pub fn push(&mut self, value: T) {
         if self.is_full() {
-            let new_cap = self.incre.appropriate_size(Layout::new::<T>(), self.cap);
+            let new_cap = (self.incre)(Layout::new::<T>(), self.cap);
             self.grow_to(new_cap);
         }
 

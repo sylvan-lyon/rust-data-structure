@@ -2,17 +2,18 @@ use core::slice;
 use std::{
     alloc::{Allocator, Global, Layout, handle_alloc_error},
     fmt::Debug,
+    hash::Hash,
     ops::{Index, IndexMut},
     ptr::{NonNull, drop_in_place},
 };
 
-use crate::{CapacityIncrement, DefaultIncrement};
+use crate::{increment, Increment};
 
-pub struct Stack<T, A = Global, C = DefaultIncrement>
+pub struct Stack<T, A = Global, C = Increment>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     /// an array with `self.cap` slots of T
     buf: *mut T,
@@ -34,23 +35,108 @@ pub struct StackIter<T, A, C>(Stack<T, A, C>)
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement;
+    C: FnMut(Layout, usize) -> usize;
 
-impl<T: Sized> Default for Stack<T, Global, DefaultIncrement> {
+impl<T: Sized> Default for Stack<T, Global, Increment> {
+    #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Sized> Stack<T, Global, DefaultIncrement> {
+impl<T: Sized> Stack<T, Global, Increment> {
     #[inline]
     pub fn new() -> Self {
-        Self::new_in(Global, DefaultIncrement)
+        Self::new_in(Global, increment)
     }
 
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self::with_capacity_in(cap, Global, DefaultIncrement)
+        Self::with_capacity_in(cap, Global, increment)
+    }
+}
+
+impl<T: Sized + Clone> Stack<T, Global, Increment> {
+    /// build a stack by cloning the elements of a slice
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    ///
+    /// let a = Stack::from_slice(&["Hello", ", ", "world"]);
+    /// let mut b = Stack::new();
+    /// b.push("Hello");
+    /// b.push(", ");
+    /// b.push("world");
+    ///
+    /// assert_eq!(a, b);
+    /// ```
+    pub fn from_slice(slice: &[T]) -> Self {
+        if slice.len() != 0 {
+            let vec = slice.iter().cloned().collect::<Vec<_>>();
+            return Self {
+                cap: vec.capacity(),
+                top: slice.len(),
+                buf: vec.leak().as_mut_ptr(),
+                ..Self::new()
+            };
+        }
+
+        Self::new()
+    }
+}
+
+impl<T, A, C> PartialEq for Stack<T, A, C>
+where
+    T: Sized + PartialEq,
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    #[inline]
+    fn ne(&self, other: &Self) -> bool {
+        !self.eq(other)
+    }
+
+    /// check if two stacks equals
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    ///
+    /// let a = Stack::from_slice(&["Hello", ", ", "world"]);
+    /// let mut b = Stack::new();
+    /// b.push("Hello");
+    /// b.push(", ");
+    /// b.push("world");
+    ///
+    /// assert_eq!(a, b);
+    /// ```
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        let lhs = self.as_slice();
+        let rhs = other.as_slice();
+
+        lhs == rhs
+    }
+}
+
+impl<T: PartialEq, A: Allocator, C: FnMut(Layout, usize) -> usize> Eq for Stack<T, A, C> {}
+
+impl<T: Hash, A: Allocator, C: FnMut(Layout, usize) -> usize> Hash for Stack<T, A, C> {
+    /// compute hash value of self
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// use std::hash::{Hash, Hasher};
+    /// use std::collections::hash_map::DefaultHasher;
+    ///
+    /// let (vec, mut vec_hash) = (vec!["Hello", "world"], DefaultHasher::new());
+    /// let (stack, mut stack_hash) = (Stack::from_slice(vec.as_slice()), DefaultHasher::new());
+    /// vec.hash(&mut vec_hash);
+    /// stack.hash(&mut stack_hash);
+    /// assert_eq!(vec_hash.finish(), stack_hash.finish());
+    /// ```
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
     }
 }
 
@@ -58,7 +144,7 @@ impl<T, A, C> Iterator for StackIter<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     type Item = T;
 
@@ -85,7 +171,7 @@ impl<T, A, C> IntoIterator for Stack<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     type Item = T;
     type IntoIter = StackIter<T, A, C>;
@@ -101,7 +187,7 @@ impl<T, A, C> Debug for Stack<T, A, C>
 where
     T: Sized + Debug,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     /// debug format, bottom on the left, top on the right
     ///
@@ -113,13 +199,11 @@ where
     /// assert_eq!(format!("{:?}", stack), "[1, 2]")
     /// ```
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list()
-            .entries((unsafe { slice::from_raw_parts::<T>(self.buf, self.top) }).iter())
-            .finish()
+        f.debug_list().entries(self.as_slice().iter()).finish()
     }
 }
 
-impl<T: Sized, A: Allocator, C: CapacityIncrement> Drop for Stack<T, A, C> {
+impl<T: Sized, A: Allocator, C: FnMut(Layout, usize) -> usize> Drop for Stack<T, A, C> {
     fn drop(&mut self) {
         // first we call destructor on each slot, reversed, in other words,
         // we destruct values in stack output order
@@ -140,7 +224,7 @@ impl<T, A, C> Clone for Stack<T, A, C>
 where
     T: Sized + Clone,
     A: Allocator + Clone,
-    C: CapacityIncrement + Clone,
+    C: FnMut(Layout, usize) -> usize + Clone,
 {
     fn clone(&self) -> Self {
         let cap = self.cap;
@@ -172,9 +256,19 @@ impl<T, A, C> IndexMut<usize> for Stack<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     /// # Get mutable reference or [copy](Copy) of `index + 1`th element of the stack
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push('👋');   // char `👋` locates at index `0` of this stack
+    /// stack[0] = '💖';
+    /// assert_eq!(stack.pop(), Some('💖'));
+    /// ```
+    ///
+    /// # Panics if index out of bound
     ///
     /// ```rust,should_panic
     /// # use list::stack::Stack;
@@ -182,14 +276,6 @@ where
     /// stack.push('👋');   // char `👋` locates at index `0` of this stack
     ///
     /// let _ = stack[1];   // panics!
-    /// ```
-    ///
-    /// ```rust,compile_fail
-    /// # use list::stack::Stack;
-    /// let mut stack = Stack::new();
-    /// stack.push(String::from("👋")); // string `👋` locates at index `0` of this stack
-    ///
-    /// let _move: String = stack[0];   // compilation error
     /// ```
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
         self.get_mut(index).expect("index stack beyond [0, top)")
@@ -200,11 +286,19 @@ impl<T, A, C> Index<usize> for Stack<T, A, C>
 where
     T: Sized,
     A: Allocator,
-    C: CapacityIncrement,
+    C: FnMut(Layout, usize) -> usize,
 {
     type Output = T;
 
     /// # Get immutable reference or [copy](Copy) of `index + 1`th element of the stack
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// stack.push('👋');   // char `👋` locates at index `0` of this stack
+    /// let first = stack[0];
+    /// assert_eq!(stack.pop(), Some(first));
+    /// ```
     ///
     /// ```rust,should_panic
     /// # use list::stack::Stack;
@@ -213,20 +307,17 @@ where
     ///
     /// let _ = stack[1];   // panics!
     /// ```
-    ///
-    /// ```rust,compile_fail
-    /// # use list::stack::Stack;
-    /// let mut stack = Stack::new();
-    /// stack.push(String::from("👋")); // string `👋` locates at index `0` of this stack
-    ///
-    /// let _move: String = stack[0];   // compilation error
-    /// ```
     fn index(&self, index: usize) -> &Self::Output {
         self.get(index).expect("index stack beyond [0, top)")
     }
 }
 
-impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
+impl<T, A, C> Stack<T, A, C>
+where
+    T: Sized,
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
     #[inline]
     pub fn new_in(alloc: A, incre: C) -> Self {
         Self {
@@ -288,6 +379,44 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
         }
     }
 
+    /// get inner data as a slice
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// assert_eq!(stack.as_slice(), &[]);
+    /// stack.push(1);
+    /// stack.push(2);
+    /// assert_eq!(stack.as_slice(), &[1, 2]);
+    /// ```
+    #[inline]
+    pub fn as_slice(&self) -> &[T] {
+        if self.is_empty() {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(self.buf, self.top) }
+        }
+    }
+
+    /// get inner data as a mutable slice
+    ///
+    /// ```rust
+    /// # use list::stack::Stack;
+    /// let mut stack = Stack::new();
+    /// assert_eq!(stack.as_slice_mut(), &mut []);
+    /// stack.push(1);
+    /// stack.push(2);
+    /// assert_eq!(stack.as_slice_mut(), &mut [1, 2]);
+    /// ```
+    #[inline]
+    pub fn as_slice_mut(&self) -> &mut [T] {
+        if self.is_empty() {
+            &mut []
+        } else {
+            unsafe { slice::from_raw_parts_mut(self.buf, self.top) }
+        }
+    }
+
     /// get top element's reference of this stack, returns [`None`] if stack is empty
     ///
     /// ```rust
@@ -340,7 +469,7 @@ impl<T: Sized, A: Allocator, C: CapacityIncrement> Stack<T, A, C> {
     #[inline]
     pub fn push(&mut self, value: T) {
         if self.top == self.cap {
-            let new_cap = self.incre.appropriate_size(Layout::new::<T>(), self.cap);
+            let new_cap = (self.incre)(Layout::new::<T>(), self.cap);
             self.grow_to(new_cap);
         }
 
