@@ -1,9 +1,13 @@
+use core::slice;
 use std::{
     alloc::{Allocator, Global, Layout, handle_alloc_error},
-    ptr::NonNull,
+    fmt::Debug,
+    mem,
+    ops::{Index, IndexMut},
+    ptr::{self, NonNull},
 };
 
-use crate::{increment, Increment};
+use crate::{Increment, increment};
 
 pub struct Queue<T, A = Global, C = Increment>
 where
@@ -33,10 +37,113 @@ where
     incre: C,
 }
 
+pub struct IntoIter<T, A, C>(Queue<T, A, C>)
+where
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize;
+
+impl<T, A, C> Iterator for IntoIter<T, A, C>
+where
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.len, Some(self.0.len))
+    }
+}
+
+impl<T, A, C> IntoIterator for Queue<T, A, C>
+where
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    type Item = T;
+    type IntoIter = IntoIter<T, A, C>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        IntoIter(self)
+    }
+}
+
+pub struct Iter<'a, T> {
+    seg1: slice::Iter<'a, T>,
+    seg2: slice::Iter<'a, T>,
+}
+
+pub struct IterMut<'a, T> {
+    seg1: slice::IterMut<'a, T>,
+    seg2: slice::IterMut<'a, T>,
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.seg1.next() {
+            Some(r) => Some(r),
+            None => {
+                mem::swap(&mut self.seg1, &mut self.seg2);
+                self.seg1.next()
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (seg1_min, seg1_max) = self.seg1.size_hint();
+        let (seg2_min, seg2_max) = self.seg2.size_hint();
+
+        (
+            seg1_min + seg2_min,
+            seg1_max.zip(seg2_max).map(|(a, b)| a + b),
+        )
+    }
+}
+
+impl<'a, T> Iterator for IterMut<'a, T> {
+    type Item = &'a mut T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.seg1.next() {
+            Some(r) => Some(r),
+            None => {
+                mem::swap(&mut self.seg1, &mut self.seg2);
+                self.seg1.next()
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (seg1_min, seg1_max) = self.seg1.size_hint();
+        let (seg2_min, seg2_max) = self.seg2.size_hint();
+
+        (
+            seg1_min + seg2_min,
+            seg1_max.zip(seg2_max).map(|(a, b)| a + b),
+        )
+    }
+}
+
 impl<T: Sized> Default for Queue<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T, A, C> Debug for Queue<T, A, C>
+where
+    T: Sized + Debug,
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -48,16 +155,107 @@ where
 {
     fn drop(&mut self) {
         for i in 0..self.len {
-            let pos = (self.head + i) % self.cap;
+            let pos = wrap(self.head + i, self.cap);
             unsafe { self.buf.add(pos).drop_in_place() }
         }
 
-        let layout = Layout::array::<T>(self.cap).unwrap();
+        let layout = Layout::array::<T>(self.cap).expect("layout");
 
         match NonNull::new(self.buf as *mut u8) {
             Some(ptr) => unsafe { self.alloc.deallocate(ptr, layout) },
             None => debug_assert_eq!(self.cap, 0),
         }
+    }
+}
+
+#[inline]
+fn wrap(val: usize, max: usize) -> usize {
+    use std::cmp::Ordering;
+    match val.cmp(&max) {
+        Ordering::Less => val,
+        Ordering::Equal => 0,
+        Ordering::Greater => val - max,
+    }
+}
+
+impl<T, A1, C1, A2, C2> PartialEq<Queue<T, A2, C2>> for Queue<T, A1, C1>
+where
+    T: PartialEq,
+    A1: Allocator,
+    A2: Allocator,
+    C1: FnMut(Layout, usize) -> usize,
+    C2: FnMut(Layout, usize) -> usize,
+{
+    fn eq(&self, other: &Queue<T, A2, C2>) -> bool {
+        if self.len != other.len {
+            return false;
+        }
+
+        self.iter().zip(other.iter()).all(|(lhs, rhs)| lhs == rhs)
+    }
+}
+
+impl<T: Eq, A: Allocator, C: FnMut(Layout, usize) -> usize> Eq for Queue<T, A, C> {}
+
+impl<T, A, C> Clone for Queue<T, A, C>
+where
+    T: Clone,
+    A: Clone + Allocator,
+    C: Clone + FnMut(Layout, usize) -> usize,
+{
+    fn clone(&self) -> Self {
+        let alloc = self.alloc.clone();
+        let layout = Layout::array::<T>(self.cap).expect("layout");
+        let buf = match NonNull::new(self.buf as *mut u8) {
+            Some(_) => alloc
+                .allocate(layout)
+                .map(|ptr| ptr.as_ptr() as *mut T)
+                .map_err(|_| handle_alloc_error(layout))
+                .unwrap(),
+            None => ptr::null_mut(),
+        };
+
+        for i in 0..self.len {
+            let pos = wrap(self.head + i, self.cap);
+            let cloned = unsafe { &*self.buf.add(pos) }.clone();
+            unsafe { buf.add(i).write(cloned) }
+        }
+
+        Self {
+            buf,
+            head: 0,
+            tail: wrap(self.len, self.cap),
+            len: self.len,
+            cap: self.cap,
+            alloc: self.alloc.clone(),
+            incre: self.incre.clone(),
+        }
+    }
+}
+
+impl<T, A, C> Index<usize> for Queue<T, A, C>
+where
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    type Output = T;
+
+    fn index(&self, idx: usize) -> &Self::Output {
+        let len = self.len;
+        self.get(idx)
+            .unwrap_or_else(|| panic!("{idx} beyond [0, {len})"))
+    }
+}
+
+impl<T, A, C> IndexMut<usize> for Queue<T, A, C>
+where
+    A: Allocator,
+    C: FnMut(Layout, usize) -> usize,
+{
+    fn index_mut(&mut self, idx: usize) -> &mut Self::Output {
+        let len = self.len;
+        self.get_mut(idx)
+            .unwrap_or_else(|| panic!("{idx} beyond [0, {len})"))
     }
 }
 
@@ -129,7 +327,44 @@ where
         self.len
     }
 
-    #[allow(unsafe_code)]
+    #[inline]
+    pub fn get(&self, idx: usize) -> Option<&T> {
+        if self.is_empty() || !idx < self.len {
+            return None;
+        }
+
+        let pos = wrap(self.head + idx, self.cap);
+        Some(unsafe { &*self.buf.add(pos) })
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, idx: usize) -> Option<&mut T> {
+        if self.is_empty() || !idx < self.len {
+            return None;
+        }
+
+        let pos = wrap(self.head + idx, self.cap);
+        Some(unsafe { &mut *self.buf.add(pos) })
+    }
+
+    #[inline]
+    pub fn peek(&self) -> Option<&T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        Some(unsafe { &*self.buf.add(self.head) })
+    }
+
+    #[inline]
+    pub fn peek_mut(&mut self) -> Option<&mut T> {
+        if self.is_empty() {
+            return None;
+        }
+
+        Some(unsafe { &mut *self.buf.add(self.head) })
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         if self.is_empty() {
             return None;
@@ -137,7 +372,7 @@ where
 
         let old = self.head;
         self.head += 1;
-        self.head %= self.cap;
+        self.head = wrap(self.head, self.cap);
         self.len -= 1;
 
         Some(unsafe { self.buf.add(old).read() })
@@ -151,10 +386,46 @@ where
 
         let old = self.tail;
         self.tail += 1;
-        self.tail %= self.cap;
+        self.tail = wrap(self.tail, self.cap);
         self.len += 1;
 
-        unsafe { self.buf.add(old).write(value) };
+        unsafe { self.buf.add(old).write(value) }
+    }
+
+    pub fn iter<'a>(&'a self) -> Iter<'a, T> {
+        let buf = self.buf;
+        use core::slice::from_raw_parts;
+        let (seg1, seg2) = if self.is_contiguous() {
+            (
+                unsafe { from_raw_parts(buf.add(self.head), self.len) }.iter(),
+                [].iter(),
+            )
+        } else {
+            (
+                unsafe { from_raw_parts(buf.add(self.head), self.cap - self.head) }.iter(),
+                unsafe { from_raw_parts(buf, self.tail) }.iter(),
+            )
+        };
+
+        Iter { seg1, seg2 }
+    }
+
+    pub fn iter_mut<'a>(&'a self) -> IterMut<'a, T> {
+        let buf = self.buf;
+        use core::slice::from_raw_parts_mut;
+        let (seg1, seg2) = if self.is_contiguous() {
+            (
+                unsafe { from_raw_parts_mut(buf.add(self.head), self.len) }.iter_mut(),
+                [].iter_mut(),
+            )
+        } else {
+            (
+                unsafe { from_raw_parts_mut(buf.add(self.head), self.cap - self.head) }.iter_mut(),
+                unsafe { from_raw_parts_mut(buf, self.tail) }.iter_mut(),
+            )
+        };
+
+        IterMut { seg1, seg2 }
     }
 
     pub fn grow_to(&mut self, new_cap: usize) {
@@ -162,7 +433,7 @@ where
             return;
         }
 
-        let (old_cap, old_buf) = (self.cap, self.buf);
+        let (old_cap, old_buf) = (self.cap, self.buf as *const T);
         let new_layout = Layout::array::<T>(new_cap).expect("layout");
         let new_buf = self
             .alloc
@@ -171,32 +442,54 @@ where
             .map_err(|_| handle_alloc_error(new_layout))
             .unwrap();
 
-        if !self.buf.is_null() {
-            for i in 0..self.tail {
-                unsafe { new_buf.add(i).write(old_buf.add(i).read()) }
-            }
-
-            let delta = new_cap - self.cap;
-            for i in self.head..self.cap {
-                let old_i = i;
-                let new_i = delta + i;
-                unsafe { new_buf.add(new_i).write(old_buf.add(old_i).read()) }
-            }
-        }
-
         match NonNull::new(old_buf as *mut u8) {
             Some(ptr) => {
                 // in case self is grown from 0
                 assert_ne!(old_cap, 0);
-                self.head += new_cap - old_cap;
+                for i in 0..self.len {
+                    let old_pos = wrap(self.head + i, old_cap);
+                    let new_pos = i;
+                    let value = unsafe { old_buf.add(old_pos).read() };
+                    unsafe { new_buf.add(new_pos).write(value) }
+                }
+
                 let old_layout = Layout::array::<T>(old_cap).expect("layout");
                 unsafe { self.alloc.deallocate(ptr, old_layout) }
             }
             None => assert_eq!(old_cap, 0),
         }
 
+        self.head = 0;
+        self.tail = self.len;
+        // self.tail = wrap(self.head + self.len, new_cap);
         self.cap = new_cap;
         self.buf = new_buf;
+    }
+
+    #[inline]
+    pub fn is_contiguous(&self) -> bool {
+        let end = if self.tail == 0 {
+            self.cap
+        } else {
+            self.tail - 1
+        };
+        self.head <= end
+    }
+
+    pub fn make_contiguous(&mut self) {
+        if self.is_contiguous() {
+            return;
+        }
+
+        for i in 0..self.len {
+            let pos = wrap(self.head + i, self.cap);
+            let old_pos = unsafe { &mut *self.buf.add(pos) };
+            let new_pos = unsafe { &mut *self.buf.add(i) };
+            std::mem::swap(new_pos, old_pos);
+        }
+
+        self.head = 0;
+        self.tail = self.len;
     }
 }
 
@@ -205,67 +498,311 @@ mod test {
     use crate::queue::Queue;
     use rand::random;
     use std::{
+        alloc::{Global, Layout},
         assert_matches,
         cell::{Cell, RefCell},
     };
 
-    const TIMES: usize = 100_000;
+    const TIMES: usize = 5_000;
+    const FIRST_HALF: usize = TIMES / 2;
+    const LAST_HALF: usize = TIMES - FIRST_HALF;
+
+    const fn power_of_two(_: Layout, curr: usize) -> usize {
+        if curr == 0 { 1 } else { curr * 2 }
+    }
 
     #[test]
-    fn test_queue_primitives() {
-        let mut queue = Queue::new();
+    fn fuzz_test_queue_primitives() {
+        let mut queue = Queue::new_in(Global, power_of_two);
         let mut fuzz = Vec::with_capacity(TIMES);
 
+        // pushing random value into the queue
         (0..TIMES).for_each(|_| {
             let r = random::<i32>();
             fuzz.push(r);
             queue.push(r);
         });
 
-        (0..TIMES).for_each(|idx| {
+        // test clone
+        let mut clone = queue.clone();
+
+        // cloned and queue must in different location
+        assert_ne!(queue.buf, clone.buf);
+        assert_eq!(queue.len(), TIMES);
+        assert_eq!(clone.len(), TIMES);
+
+        // clone[i] should equal to queue[idx]
+        (0..TIMES).for_each(|idx| assert_eq!(clone[idx], queue[idx]));
+
+        // stack[i] should equal to fuzz[idx]
+        (0..TIMES).for_each(|idx| assert_eq!(fuzz[idx], queue[idx]));
+
+        (0..FIRST_HALF).for_each(|idx| {
+            assert_eq!(queue.peek(), clone.peek());
             assert_matches!(queue.pop(), Some(x) if fuzz[idx] == x);
+            assert_matches!(clone.pop(), Some(x) if fuzz[idx] == x);
+        });
+        assert_eq!(queue.len(), LAST_HALF);
+        assert_eq!(clone.len(), LAST_HALF);
+
+        // now again, this enforces queue to wrap up
+        (0..FIRST_HALF).for_each(|_| {
+            let r = random::<i32>();
+            fuzz.push(r);
+            queue.push(r);
+        });
+        let mut clone = queue.clone();
+        assert_eq!(queue.len(), TIMES);
+        assert_eq!(clone.len(), TIMES);
+        assert!(!queue.is_empty());
+        assert!(!clone.is_empty());
+
+        assert_ne!(queue.head, 0);
+        assert_eq!(clone.head, 0); // because clone makes a contiguous queue
+
+        // queue[i] should equal to fuzz[idx]
+        (0..TIMES).for_each(|idx| assert_eq!(fuzz[idx + FIRST_HALF], queue[idx]));
+
+        (0..TIMES).for_each(|idx| {
+            assert_eq!(queue.peek(), clone.peek());
+            assert_matches!(queue.pop(), Some(x) if fuzz[idx + FIRST_HALF] == x);
+            assert_matches!(clone.pop(), Some(x) if fuzz[idx + FIRST_HALF] == x);
         });
 
         assert_matches!(queue.pop(), None);
+        assert_matches!(clone.pop(), None);
     }
 
     #[test]
     fn test_queue_drop() {
         thread_local! {
-            /// DROPED[i] == false means the flower with id `i` has not been dropped
-            static DROPED: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+            /// DROPPED[i] == false means the flower with id `i` has not been dropped
+            static DROPPED: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+
+            /// DROPPED_SEQ[i] == id means the item with id `id` is the `i + 1`th item dropped
+            static DROPPED_SEQ: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(TIMES));
+
+            /// DROPPED_CLONE[i] == false means the flower with id `i` has not been dropped
+            static DROPPED_CLONE: RefCell<Vec<bool>> = RefCell::new((0..TIMES).map(|_| false).collect());
+
+            /// DROPPED_CLONE_SEQ[i] == id means the item with id `id` is the `i + 1`th item dropped
+            static DROPPED_CLONE_SEQ: RefCell<Vec<usize>> = RefCell::new(Vec::with_capacity(TIMES));
 
             /// next item id
-            static NEXT_ID: Cell<usize> = Cell::new(0);
+            static NEXT_ID: Cell<usize> = const { Cell::new(0) };
         }
 
-        #[derive(Clone)]
         struct Item {
             id: usize,
-        }
-
-        impl Item {
-            fn rand() -> Self {
-                let id = NEXT_ID.get();
-                NEXT_ID.set(id + 1);
-                Self { id }
-            }
-        }
-
-        impl Drop for Item {
-            fn drop(&mut self) {
-                DROPED.with_borrow_mut(|vec| vec[self.id] = true)
-            }
+            cloned: bool,
         }
 
         {
+            // queue's lifetime begins here
             let mut queue = Queue::new();
 
             (0..TIMES).for_each(|_| {
-                queue.push(Item::rand());
+                queue.push(Item::new());
             });
-        }
 
-        assert!(DROPED.with_borrow(|v| v.iter().all(|presence| *presence)));
+            let _cloned = queue.clone();
+        }
+        // ends before this back curly brace
+
+        assert!(DROPPED_CLONE.with_borrow(|vec| vec.iter().all(|dropped| *dropped)));
+        assert!(DROPPED.with_borrow(|vec| vec.iter().all(|dropped| *dropped)));
+        assert!(
+            DROPPED_CLONE_SEQ
+                .with_borrow(|vec| { vec.iter().enumerate().all(|(index, id)| index == *id) })
+        );
+        assert!(
+            DROPPED_SEQ
+                .with_borrow(|vec| { vec.iter().enumerate().all(|(index, id)| index == *id) })
+        );
+
+        // impl Item
+        const _: () = {
+            impl Item {
+                fn new() -> Self {
+                    let id = NEXT_ID.get();
+                    NEXT_ID.set(id + 1);
+                    Self { id, cloned: false }
+                }
+            }
+
+            impl Drop for Item {
+                fn drop(&mut self) {
+                    if self.cloned {
+                        DROPPED_CLONE_SEQ.with_borrow_mut(|vec| vec.push(self.id));
+                        DROPPED_CLONE.with_borrow_mut(|vec| vec[self.id] = true)
+                    } else {
+                        DROPPED_SEQ.with_borrow_mut(|vec| vec.push(self.id));
+                        DROPPED.with_borrow_mut(|vec| vec[self.id] = true)
+                    }
+                }
+            }
+
+            impl Clone for Item {
+                fn clone(&self) -> Self {
+                    Self {
+                        id: self.id,
+                        cloned: true,
+                    }
+                }
+            }
+        };
+    }
+
+    #[test]
+    fn test_contiguous() {
+        let mut queue = Queue::new_in(Global, power_of_two);
+
+        queue.push('A'); // A
+        queue.push('B'); // AB
+        queue.push('C'); // ABC.
+
+        queue.pop(); // .BC.
+        assert_eq!(queue.head, 1);
+        assert_eq!(queue.tail, 3);
+
+        queue.push('D'); // .BCD
+        assert!(queue.is_contiguous());
+        queue.push('E'); // ECBD
+        assert!(!queue.is_contiguous());
+        assert_eq!(queue.head, 1);
+        assert_eq!(queue.tail, 1);
+        assert_eq!(queue.len, 4);
+        assert_eq!(queue.cap, 4);
+    }
+
+    #[test]
+    fn test_queue_clone_contiguous() {
+        let mut queue = Queue::new_in(Global, power_of_two);
+        assert!(queue.is_contiguous());
+
+        queue.push('A'); // A
+        queue.push('B'); // AB
+        queue.push('C'); // ABC.
+
+        queue.pop(); // .BC.
+        assert_eq!(queue.head, 1);
+        assert_eq!(queue.tail, 3);
+
+        let clone = queue.clone();
+        assert_eq!(clone.head, 0);
+        assert_eq!(clone.tail, 2);
+        assert!(clone.is_contiguous());
+
+        queue.push('D'); // .BCD
+        assert!(queue.is_contiguous());
+
+        let clone = queue.clone();
+        assert_eq!(clone.head, 0);
+        assert_eq!(clone.tail, 3);
+        assert!(clone.is_contiguous());
+
+        queue.push('E'); // EBCD
+        assert!(!queue.is_contiguous());
+
+        let clone = queue.clone();
+        assert_eq!(clone.head, 0);
+        assert_eq!(clone.tail, 0);
+        assert!(clone.is_contiguous());
+
+        assert!(queue.clone().is_contiguous());
+        assert_eq!(queue.head, 1);
+        assert_eq!(queue.tail, 1);
+        assert_eq!(queue.len, 4);
+        assert_eq!(queue.cap, 4);
+    }
+
+    #[test]
+    fn test_queue_iter() {
+        let mut queue = Queue::new_in(Global, power_of_two);
+
+        queue.push('A'); // A
+        queue.push('B'); // AB
+        queue.push('C'); // ABC.
+
+        let iter = queue.iter();
+        assert_eq!(iter.seg1.len(), 3);
+        assert_eq!(iter.seg2.len(), 0);
+        assert_eq!(Vec::from_iter(iter.copied()), vec!['A', 'B', 'C']);
+
+        queue.pop(); // .BC.
+
+        let iter = queue.iter();
+        assert_eq!(iter.seg1.len(), 2);
+        assert_eq!(iter.seg2.len(), 0);
+        assert_eq!(Vec::from_iter(iter.copied()), vec!['B', 'C']);
+
+        queue.push('D'); // .BCD
+        let iter = queue.iter();
+        assert_eq!(iter.seg1.len(), 3);
+        assert_eq!(iter.seg2.len(), 0);
+        assert_eq!(Vec::from_iter(iter.copied()), vec!['B', 'C', 'D']);
+
+        queue.push('E'); // EBCD
+        let iter = queue.iter();
+        assert_eq!(iter.seg1.len(), 3);
+        assert_eq!(iter.seg2.len(), 1);
+        assert_eq!(
+            Vec::from_iter(iter.seg1.clone().copied()),
+            vec!['B', 'C', 'D']
+        );
+        assert_eq!(Vec::from_iter(iter.seg2.clone().copied()), vec!['E']);
+        assert_eq!(Vec::from_iter(iter.copied()), vec!['B', 'C', 'D', 'E']);
+
+        queue.pop();
+        queue.pop(); // E..D
+        let iter = queue.iter();
+        assert_eq!(iter.seg1.len(), 1);
+        assert_eq!(iter.seg2.len(), 1);
+        assert_eq!(Vec::from_iter(iter.seg1.clone().copied()), vec!['D']);
+        assert_eq!(Vec::from_iter(iter.seg2.clone().copied()), vec!['E']);
+        assert_eq!(Vec::from_iter(iter.copied()), vec!['D', 'E']);
+    }
+
+    #[test]
+    fn test_queue_eq() {
+        let mut queue = Queue::new_in(Global, power_of_two);
+        assert!(queue.is_contiguous());
+
+        queue.push('A'); // A
+        queue.push('B'); // AB
+        queue.push('C'); // ABC.
+        let mut queue2 = Queue::new();
+        queue2.push('A');
+        queue2.push('B');
+        queue2.push('C');
+        assert_eq!(queue, queue2);
+
+        queue.pop(); // .BC.
+        let mut queue2 = Queue::new();
+        queue2.push('B');
+        queue2.push('C');
+        assert_eq!(queue, queue2);
+
+        queue.push('D'); // .BCD
+        let mut queue2 = Queue::new();
+        queue2.push('B');
+        queue2.push('C');
+        queue2.push('D');
+        assert_eq!(queue, queue2);
+
+        queue.push('E'); // EBCD
+        let mut queue2 = Queue::new();
+        queue2.push('B');
+        queue2.push('C');
+        queue2.push('D');
+        queue2.push('E');
+        assert_eq!(queue, queue2);
+
+        queue.pop();
+        queue.pop(); // E..D
+        let mut queue2 = Queue::new();
+        queue2.push('D');
+        queue2.push('E');
+        assert_eq!(queue, queue2);
     }
 }

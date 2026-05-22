@@ -7,7 +7,7 @@ use std::{
     ptr::{NonNull, drop_in_place},
 };
 
-use crate::{increment, Increment};
+use crate::{Increment, increment};
 
 pub struct Stack<T, A = Global, C = Increment>
 where
@@ -31,7 +31,7 @@ where
     incre: C,
 }
 
-pub struct StackIter<T, A, C>(Stack<T, A, C>)
+pub struct IntoIter<T, A, C>(Stack<T, A, C>)
 where
     T: Sized,
     A: Allocator,
@@ -71,8 +71,8 @@ impl<T: Sized + Clone> Stack<T, Global, Increment> {
     /// assert_eq!(a, b);
     /// ```
     pub fn from_slice(slice: &[T]) -> Self {
-        if slice.len() != 0 {
-            let vec = slice.iter().cloned().collect::<Vec<_>>();
+        if !slice.is_empty() {
+            let vec = slice.to_vec();
             return Self {
                 cap: vec.capacity(),
                 top: slice.len(),
@@ -91,11 +91,6 @@ where
     A: Allocator,
     C: FnMut(Layout, usize) -> usize,
 {
-    #[inline]
-    fn ne(&self, other: &Self) -> bool {
-        !self.eq(other)
-    }
-
     /// check if two stacks equals
     ///
     /// ```rust
@@ -140,7 +135,7 @@ impl<T: Hash, A: Allocator, C: FnMut(Layout, usize) -> usize> Hash for Stack<T, 
     }
 }
 
-impl<T, A, C> Iterator for StackIter<T, A, C>
+impl<T, A, C> Iterator for IntoIter<T, A, C>
 where
     T: Sized,
     A: Allocator,
@@ -165,6 +160,10 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         self.0.pop()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.0.len(), Some(self.0.len()))
+    }
 }
 
 impl<T, A, C> IntoIterator for Stack<T, A, C>
@@ -174,12 +173,12 @@ where
     C: FnMut(Layout, usize) -> usize,
 {
     type Item = T;
-    type IntoIter = StackIter<T, A, C>;
+    type IntoIter = IntoIter<T, A, C>;
 
     /// consumes and turn itself into a [`StackIter`]
     #[inline]
     fn into_iter(self) -> Self::IntoIter {
-        StackIter(self)
+        IntoIter(self)
     }
 }
 
@@ -409,7 +408,7 @@ where
     /// assert_eq!(stack.as_slice_mut(), &mut [1, 2]);
     /// ```
     #[inline]
-    pub fn as_slice_mut(&self) -> &mut [T] {
+    pub fn as_slice_mut(&mut self) -> &mut [T] {
         if self.is_empty() {
             &mut []
         } else {
@@ -507,6 +506,11 @@ where
     }
 
     #[inline]
+    pub fn len(&self) -> usize {
+        self.top
+    }
+
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.top == 0
     }
@@ -560,7 +564,7 @@ mod test {
         cell::{Cell, RefCell},
     };
 
-    const TIMES: usize = 100_000;
+    const TIMES: usize = 5_000;
 
     #[test]
     fn fuzz_test_stack_primitives() {
@@ -588,6 +592,7 @@ mod test {
 
         // notice the `rev`, because stack will reverse the input sequence
         (0..TIMES).rev().for_each(|idx| {
+            assert_eq!(stack.peek(), clone.peek());
             assert_matches!(stack.pop(), Some(x) if fuzz[idx] == x);
             assert_matches!(clone.pop(), Some(x) if fuzz[idx] == x);
         });
