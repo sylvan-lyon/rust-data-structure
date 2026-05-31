@@ -133,10 +133,16 @@ fn test_queue_drop() {
             fn drop(&mut self) {
                 if self.cloned {
                     DROPPED_CLONE_SEQ.with_borrow_mut(|vec| vec.push(self.id));
-                    DROPPED_CLONE.with_borrow_mut(|vec| vec[self.id] = true)
+                    DROPPED_CLONE.with_borrow_mut(|vec| {
+                        assert_eq!(vec.get(self.id).copied(), Some(false));
+                        vec[self.id] = true
+                    })
                 } else {
                     DROPPED_SEQ.with_borrow_mut(|vec| vec.push(self.id));
-                    DROPPED.with_borrow_mut(|vec| vec[self.id] = true)
+                    DROPPED.with_borrow_mut(|vec| {
+                        assert_eq!(vec.get(self.id).copied(), Some(false));
+                        vec[self.id] = true
+                    })
                 }
             }
         }
