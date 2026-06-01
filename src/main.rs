@@ -1,25 +1,24 @@
 #![feature(fn_traits, unboxed_closures)]
 
-pub struct Resursive {
+pub struct Recursive {
     times: i32,
 }
 
-impl Resursive {
-    fn new() -> Resursive {
+impl Recursive {
+    fn new() -> Recursive {
         Self { times: 0 }
     }
 }
 
-impl FnOnce<()> for Resursive {
+impl FnOnce<()> for Recursive {
     type Output = i32;
 
     extern "rust-call" fn call_once(mut self, args: ()) -> Self::Output {
-        println!("self call once");
         self.call_mut(args)
     }
 }
 
-impl FnMut<()> for Resursive {
+impl FnMut<()> for Recursive {
     extern "rust-call" fn call_mut(&mut self, _: ()) -> Self::Output {
         if self.times == 3 {
             return self.times;
@@ -33,7 +32,7 @@ impl FnMut<()> for Resursive {
 
 fn main() {
     println!("before first call");
-    let mut closure = Resursive::new();
+    let mut closure = Recursive::new();
     println!("printed {} times.", closure());
     println!("before second call");
     closure.call_mut(());
